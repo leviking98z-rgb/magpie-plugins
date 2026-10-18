@@ -1518,6 +1518,53 @@ async function liveModels(site, a) {
 // The code is matched whole, as with 14018.
 const AFTER_TOOLS_REFUSED = /must end with a user message|["']code["']\s*:\s*["']?11153(?![\d.])/i
 
+const INVALID_REQUEST_RETRIES = 10
+
+// This generic upstream 11133 can be transient: an unchanged request was
+// subsequently served. Specific schema, permission and quota errors stay errors.
+function retryableInvalidRequest(text) {
+  try {
+    const v = JSON.parse(text)
+    const e = v?.extError
+    return (v?.code === 11133 || v?.code === "11133") && v.msg === "Invalid request parameters" &&
+      (e?.code === "0" || e?.code === 0) && e.type === "invalid_request_error" &&
+      e.param === "input" && (e.StatusCode === 400 || e.StatusCode === "400") &&
+      e.message === "the request parameters were rejected by the model provider"
+  } catch {
+    return false
+  }
+}
+
+function waitForInvalidRequestRetry(ms, signal) {
+  signal?.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", abort, { once: true })
+  })
+}
+
+async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequestRetry) {
+  for (let attempt = 0; ; attempt++) {
+    signal?.throwIfAborted()
+    const res = await send(body)
+    // Never replay a successful stream: it may already contain a tool call.
+    if (res.status !== 400 || attempt === INVALID_REQUEST_RETRIES) return res
+    if (!retryableInvalidRequest(await res.clone().text())) return res
+    await res.body?.cancel()
+    signal?.throwIfAborted()
+    const delay = Math.min(1000 * 2 ** attempt, 5000)
+    console.warn(`[workbuddy] transient upstream 11133; retry ${attempt + 1}/${INVALID_REQUEST_RETRIES} in ${delay}ms`)
+    await wait(delay, signal)
+  }
+}
+
 // replyAfterTools is a chat ending with tool results then the user's
 // message(s), with an empty assistant message between them, as if the model
 // had said nothing after the results. Tried with a real WorkBuddy AI
@@ -1605,8 +1652,11 @@ function makePlugin(site) {
             const fit = fitted(body)
             body = normalizeToolChoice(fit.body)
             attend(headers, body, session)
+            const signal = init?.signal ?? req?.signal
             const send = (b) =>
-              fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: b }).catch((e) => unanswered(site, a, b, e, init?.signal))
+              retryInvalidRequest((payload) =>
+                fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: payload, signal })
+                  .catch((e) => unanswered(site, a, payload, e, signal)), b, signal)
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
             const model = chatOf(body)?.model
@@ -1762,4 +1812,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, INVALID_REQUEST_RETRIES, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }

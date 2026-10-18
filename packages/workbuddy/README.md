@@ -116,6 +116,15 @@ serves; a model that refused it once gets it that way from then on, until
 the plugin restarts. A chat ending with the assistant's message (a prefill)
 is refused as before.
 
+The generic upstream `11133` whose `extError` names `input` and says the
+model provider rejected the request is retried up to 10 times (11 sends
+including the first), with delays of 1, 2, 4, then at most 5 seconds.
+An unchanged captured request succeeded on replay, so this particular
+error is not always a permanent validation failure. Retries keep the body,
+model and conversation ids unchanged, stop on cancellation, and never
+replay a successful stream. Specific schema errors, permissions and quota
+refusals are not retried here; an exhausted retry budget returns the error.
+
 ## Models
 
 When you are signed in, the models are the ones WorkBuddy's product config
