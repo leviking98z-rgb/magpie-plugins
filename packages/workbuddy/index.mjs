@@ -1519,6 +1519,7 @@ async function liveModels(site, a) {
 const AFTER_TOOLS_REFUSED = /must end with a user message|["']code["']\s*:\s*["']?11153(?![\d.])/i
 
 const INVALID_REQUEST_RETRIES = 10
+const INVALID_REQUEST_FAILOVER_RETRIES = 1
 
 // This generic upstream 11133 can be transient: an unchanged request was
 // subsequently served. Specific schema, permission and quota errors stay errors.
@@ -1550,17 +1551,40 @@ function waitForInvalidRequestRetry(ms, signal) {
   })
 }
 
-async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequestRetry) {
+function unavailableInput(res, text, attempts) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  headers.set("content-type", "application/json")
+  // Magpie recognizes this as model-local, not an exhausted account. Keep
+  // the upstream status and evidence; this says nothing about the cause.
+  return new Response(JSON.stringify({ error: {
+    message: `Model temporarily not available for this request after ${attempts} upstream input rejections (WorkBuddy 11133: Invalid request parameters)`,
+    type: "upstream_model_unavailable",
+    code: 11133,
+    param: "input",
+    attempts,
+    upstream: JSON.parse(text),
+  } }), { status: res.status, statusText: res.statusText, headers })
+}
+
+async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequestRetry, failover = false) {
+  const retries = failover === true ? INVALID_REQUEST_FAILOVER_RETRIES : INVALID_REQUEST_RETRIES
   for (let attempt = 0; ; attempt++) {
     signal?.throwIfAborted()
     const res = await send(body)
     // Never replay a successful stream: it may already contain a tool call.
-    if (res.status !== 400 || attempt === INVALID_REQUEST_RETRIES) return res
-    if (!retryableInvalidRequest(await res.clone().text())) return res
+    if (res.status !== 400 || (attempt === retries && failover !== true)) return res
+    const text = await res.clone().text()
+    if (!retryableInvalidRequest(text)) return res
     await res.body?.cancel()
     signal?.throwIfAborted()
+    if (attempt === retries) {
+      console.warn(`[workbuddy] transient upstream 11133 after ${attempt + 1} attempts; trying a configured fallback if available`)
+      return unavailableInput(res, text, attempt + 1)
+    }
     const delay = Math.min(1000 * 2 ** attempt, 5000)
-    console.warn(`[workbuddy] transient upstream 11133; retry ${attempt + 1}/${INVALID_REQUEST_RETRIES} in ${delay}ms`)
+    console.warn(`[workbuddy] transient upstream 11133; retry ${attempt + 1}/${retries} in ${delay}ms`)
     await wait(delay, signal)
   }
 }
@@ -1587,7 +1611,7 @@ function makePlugin(site) {
   // the models of this site that refused tool results then the user's
   // message, for this run: their next chats go with replyAfterTools at once
   const endsAfterTools = new Set()
-  return async ({ client }) => ({
+  return async ({ client }, options = {}) => ({
     config: async (config) => {
       config.provider ??= {}
       config.provider[site.id] ??= {}
@@ -1653,10 +1677,13 @@ function makePlugin(site) {
             body = normalizeToolChoice(fit.body)
             attend(headers, body, session)
             const signal = init?.signal ?? req?.signal
+            const failoverModels = options?.transientInputFailoverModels
+            const failover = Array.isArray(failoverModels) && failoverModels.includes(chatOf(body)?.model)
             const send = (b) =>
               retryInvalidRequest((payload) =>
                 fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: payload, signal })
-                  .catch((e) => unanswered(site, a, payload, e, signal)), b, signal)
+                  .catch((e) => unanswered(site, a, payload, e, signal)), b, signal,
+                waitForInvalidRequestRetry, failover)
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
             const model = chatOf(body)?.model
@@ -1812,4 +1839,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, INVALID_REQUEST_RETRIES, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, INVALID_REQUEST_RETRIES, INVALID_REQUEST_FAILOVER_RETRIES, unavailableInput, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }

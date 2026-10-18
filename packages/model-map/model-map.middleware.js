@@ -13,6 +13,7 @@
 // model's name in replies.
 
 export function onRequest(body, ctx) {
+  if (Array.isArray(ctx.options?.agents) && !ctx.options.agents.includes(ctx.agent)) return
   // the gateway puts a Gemini request's model in its body too (the URL's
   // model, which it reads from there as for every other API)
   if (body.model === null || typeof body.model !== "string") return

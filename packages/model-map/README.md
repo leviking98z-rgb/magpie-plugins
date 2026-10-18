@@ -17,6 +17,9 @@ Install it from magpie's **Plugins › Discover**, or with `magpie plugin add @m
 - **Patterns.** A key written `/like this/` is a regular expression, and its target can use `$1` for the first group.
 - **Flat form.** New API's flat form, `{"fast": "deepseek-chat"}`, works as well.
 - **`keep_upstream_name`.** Set it to `true` to leave the upstream model's name in replies.
+- **`agents`.** An optional list of Magpie agent ids, e.g. `["codex"]`.
+  Only requests from those agents are mapped; an unknown caller is not.
+  Omit it to keep the default of mapping every caller.
 
 The target has to be a model magpie can route: a model of one of your providers, or one of magpie's own ids (`deepseek/deepseek-chat`, for example).
 

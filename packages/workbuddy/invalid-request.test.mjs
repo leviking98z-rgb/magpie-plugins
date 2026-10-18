@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal } from "./index.mjs"
 
-const { INVALID_REQUEST_RETRIES, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest } = _internal
+const { INVALID_REQUEST_RETRIES, INVALID_REQUEST_FAILOVER_RETRIES, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest } = _internal
 const refusal = {
   code: 11133,
   msg: "Invalid request parameters",
@@ -64,6 +64,81 @@ test("success on the tenth retry is accepted without reading the stream", async 
   expect(res).toBe(success)
   expect(res.bodyUsed).toBe(false)
   expect(await res.text()).toBe("data: [DONE]\n\n")
+})
+
+test("opt-in failover gives the gateway a model-local error after one retry", async () => {
+  expect(INVALID_REQUEST_FAILOVER_RETRIES).toBe(1)
+  const sent = [], waits = []
+  const res = await retryInvalidRequest(async (payload) => {
+    sent.push(payload)
+    const response = failed()
+    response.headers.set("content-length", "123")
+    response.headers.set("content-encoding", "gzip")
+    return response
+  }, body, undefined, async (ms) => { waits.push(ms) }, true)
+  expect(sent).toEqual([body, body])
+  expect(waits).toEqual([1000])
+  expect(res.status).toBe(400)
+  expect(res.headers.get("x-request-id")).toBe("fixture-request")
+  expect(res.headers.has("content-length")).toBe(false)
+  expect(res.headers.has("content-encoding")).toBe(false)
+  expect(await res.json()).toEqual({ error: {
+    message: "Model temporarily not available for this request after 2 upstream input rejections (WorkBuddy 11133: Invalid request parameters)",
+    type: "upstream_model_unavailable", code: 11133, param: "input", attempts: 2, upstream: refusal,
+  } })
+})
+
+test("failover never replays successful streams, even an in-stream error", async () => {
+  for (const text of ["data: [DONE]\n\n", 'data: {"error":{"message":"stream failed"}}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"run","arguments":"{}"}}]}}]}\n\n',
+  ]) {
+    let calls = 0
+    const response = new Response(text, { headers: { "content-type": "text/event-stream" } })
+    const res = await retryInvalidRequest(async () => { calls++; return response }, body, undefined, async () => {}, true)
+    expect(calls).toBe(1)
+    expect(res).toBe(response)
+    expect(res.bodyUsed).toBe(false)
+    expect(await res.text()).toBe(text)
+  }
+})
+
+test("failover does not reclassify schema, context, auth, quota or transport errors", async () => {
+  const responses = [
+    failed({ ...refusal, extError: { ...refusal.extError, param: "tools[0]" } }),
+    failed({ ...refusal, extError: { ...refusal.extError, message: "context length exceeded" } }),
+    failed({ code: 11140, msg: "Account restricted" }),
+    failed({ code: 14018, msg: "Credits exhausted" }),
+    failed(refusal, 401), failed(refusal, 403), failed(refusal, 429), failed(refusal, 503),
+    new Response("not JSON", { status: 400 }),
+  ]
+  for (const response of responses) {
+    let calls = 0
+    const res = await retryInvalidRequest(async () => { calls++; return response }, body, undefined, async () => {}, true)
+    expect(calls).toBe(1)
+    expect(res).toBe(response)
+    expect(res.bodyUsed).toBe(false)
+    await res.text()
+  }
+})
+
+test("a successful retry returns before any failover classification", async () => {
+  let calls = 0
+  const success = served()
+  const res = await retryInvalidRequest(async () => ++calls === 1 ? failed() : success, body, undefined, async () => {}, true)
+  expect(calls).toBe(2)
+  expect(res).toBe(success)
+  expect(res.bodyUsed).toBe(false)
+})
+
+test("cancellation wins over failover after the final rejection", async () => {
+  const controller = new AbortController()
+  const reason = new Error("cancelled before failover")
+  let calls = 0
+  await expect(retryInvalidRequest(async () => {
+    if (++calls === 2) controller.abort(reason)
+    return failed()
+  }, body, controller.signal, async () => {}, true)).rejects.toBe(reason)
+  expect(calls).toBe(2)
 })
 
 test("success and nonmatching errors are not consumed or retried", async () => {
@@ -141,6 +216,35 @@ test("retry timers detach cancellation listeners when completed", async () => {
 })
 
 for (const plugin of [WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin]) {
+  test(`${plugin.name || "WorkBuddy"} loader opts in only the listed model`, async () => {
+    const originalFetch = globalThis.fetch
+    const sent = []
+    globalThis.fetch = async (url, init) => {
+      sent.push({ url, body: init.body, headers: Object.fromEntries(init.headers) })
+      return failed()
+    }
+    try {
+      const hooks = await plugin({ client: {} }, { transientInputFailoverModels: ["gpt-6-astra"] })
+      const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "fixture", uid: "fixture", expires: Date.now() + 3600_000 }))
+      const res = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body })
+      expect(sent.length).toBe(2)
+      expect(sent[0]).toEqual(sent[1])
+      expect(res.status).toBe(400)
+      expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
+      expect((await res.json()).error.type).toBe("upstream_model_unavailable")
+      // A different model keeps the old retry policy: its third send can succeed.
+      sent.length = 0
+      globalThis.fetch = async () => { sent.push(true); return sent.length < 3 ? failed() : served() }
+      const other = JSON.stringify({ ...JSON.parse(body), model: "kimi-k3-1" })
+      const untouched = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body: other })
+      expect(sent.length).toBe(3)
+      expect(untouched.status).toBe(200)
+      await untouched.text()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test(`${plugin.name || "WorkBuddy"} loader retries without changing the request or conversation ids`, async () => {
     const originalFetch = globalThis.fetch
     const sent = []

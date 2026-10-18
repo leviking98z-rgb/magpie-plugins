@@ -125,6 +125,36 @@ model and conversation ids unchanged, stop on cancellation, and never
 replay a successful stream. Specific schema errors, permissions and quota
 refusals are not retried here; an exhausted retry budget returns the error.
 
+### Opt-in model failover in Magpie
+
+When a routing group has alternative models, set this plugin's options:
+
+```json
+{"transientInputFailoverModels":["gpt-6.1-sol","gpt-6-astra","claude-opus-5.5","claude-opus-5"]}
+```
+
+Only those exact upstream model ids use one retry (two sends, 1 second
+apart) for the generic `11133` above. A second identical rejection is
+returned as a model-local availability error, with the original HTTP 400,
+upstream error, request-id header and attempt count preserved. Magpie can
+then try the next configured group member and cool down the failed model,
+not the whole WorkBuddy account. This is a routing policy, not proof that
+the upstream is overloaded. An unlisted model keeps the ten-retry policy.
+
+The plugin does not select or silently substitute models itself. Configure
+Magpie's ordered routing groups and session affinity to keep the first
+successful model. Existing Magpie handling applies to 429, 5xx and network
+failures; specific validation errors are not turned into availability
+errors. Neither retries nor classification consume a successful stream.
+
+`scripts/workbuddy-failover-policy.mjs` describes a WorkBuddy-only pool and
+the options for the existing `model-map` middleware, scoped to Codex. It preserves the
+initially selected pool member as first choice, maps only explicit pool
+aliases (not other providers or arbitrary groups), and keeps the actual
+served model in replies. `group/wb-failover` starts with GPT-6.1-Sol.
+These groups are for continuity, not single-model benchmark attribution;
+inspect the served model in the routing log when a fallback is used.
+
 ## Models
 
 When you are signed in, the models are the ones WorkBuddy's product config
