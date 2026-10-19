@@ -57,32 +57,53 @@ class Fixture(BaseHTTPRequestHandler):
         result = self.server.results.get(model, "ok")
         if isinstance(result, tuple):
             status, error = result
-            data = json.dumps(error).encode()
-            self.send_response(status)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        self.send_response(200)
-        self.send_header("content-type", "text/event-stream")
+            reply = {"status": status, "type": "application/json", "body": json.dumps(error)}
+        else:
+            choices = {"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": None}
+            if result == "tool":
+                choices["delta"] = {"role": "assistant", "tool_calls": [{
+                    "index": 0, "id": "fixture-call", "type": "function",
+                    "function": {"name": "fixture_tool", "arguments": "{}"},
+                }]}
+            elif result in ("empty", "counted-empty"):
+                choices["delta"] = {"role": "assistant", "content": ""}
+            elif result == "reasoning":
+                choices["delta"] = {"reasoning_content": "Thinking"}
+            event = {"id": "fixture", "object": "chat.completion.chunk", "model": model, "choices": [choices]}
+            text = "data: " + json.dumps(event) + "\n\n"
+            if result == "late-error":
+                event = {"error": {"message": "fixture upstream disconnected", "type": "server_error"}}
+            else:
+                event["choices"] = [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if result == "tool" else "stop"}]
+                if result in ("empty", "counted-empty"):
+                    event["usage"] = {"prompt_tokens": 100 if result == "counted-empty" else 0, "completion_tokens": 0}
+            text += "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
+            if result == "done-only":
+                text = "data: [DONE]\n\n"
+            elif result == "empty-eof":
+                text = ""
+            reply = {"status": 200, "type": "text/event-stream", "body": text}
+            if result == "empty-json":
+                reply.update(type="application/json", body=json.dumps({
+                    "choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                }))
+        if self.server.plugin:
+            reply = json.loads(subprocess.check_output([
+                "node", str(ROOT / "scripts" / "workbuddy-response-fixture.mjs"), str(self.server.plugin),
+            ], input=json.dumps({"request": body, "reply": reply, "options": self.server.plugin_options}), text=True))
+            self.server.plugin_sends.extend(reply["sends"])
+        self.send_response(reply["status"])
+        self.send_header("content-type", reply["type"])
         self.end_headers()
-        choices = {"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": None}
-        if result == "tool":
-            choices["delta"] = {"role": "assistant", "tool_calls": [{
-                "index": 0, "id": "fixture-call", "type": "function",
-                "function": {"name": "fixture_tool", "arguments": "{}"},
-            }]}
-        event = {"id": "fixture", "object": "chat.completion.chunk", "model": model, "choices": [choices]}
-        self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
-        self.wfile.flush()
+        text = reply["body"]
         if result == "late-error":
             # Content already reached the client: no second model may answer.
+            first, text = text.split("\n\n", 1)
+            self.wfile.write((first + "\n\n").encode())
+            self.wfile.flush()
             time.sleep(0.05)
-            event = {"error": {"message": "fixture upstream disconnected", "type": "server_error"}}
-        else:
-            event["choices"] = [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if result == "tool" else "stop"}]
-        self.wfile.write(("data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n").encode())
+        self.wfile.write(text.encode())
 
 
 def unused_port():
@@ -92,7 +113,7 @@ def unused_port():
 
 
 @contextlib.contextmanager
-def gateway(binary, p, output):
+def gateway(binary, p, output, plugin=None):
     with tempfile.TemporaryDirectory(prefix="workbuddy-gateway-smoke-") as home:
         home = Path(home)
         config = home / "config" / "magpie"
@@ -100,6 +121,8 @@ def gateway(binary, p, output):
         port = unused_port()
         fixture = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
         fixture.calls, fixture.results = [], {}
+        fixture.plugin, fixture.plugin_sends = plugin, []
+        fixture.plugin_options = p["pluginOptions"]
         fixture.models = p["pluginOptions"]["transientInputFailoverModels"]
         threading.Thread(target=fixture.serve_forever, daemon=True).start()
         providers = {"providers": [{
@@ -159,9 +182,10 @@ def request(port, model, session, protocol="chat", tools=False, agent="codex"):
         path = "/v1/chat/completions"
         body["messages"] = [{"role": "user", "content": "Reply OK."}]
     if tools:
-        body["tools"] = [{"type": "function", "function": {
+        tool = {
             "name": "fixture_tool", "description": "Never executed.", "parameters": {"type": "object", "properties": {}},
-        }}]
+        }
+        body["tools"] = [{"type": "function", **tool} if protocol == "responses" else {"type": "function", "function": tool}]
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), headers={
         "content-type": "application/json", "authorization": "Bearer magpie" + (f"-{agent}" if agent else ""), "session_id": session,
     })
@@ -177,6 +201,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--magpie", default=shutil.which("magpie"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--workbuddy-plugin", type=Path, default=ROOT / "packages" / "workbuddy" / "index.mjs")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     p = node_json("import {policy} from './scripts/workbuddy-failover-policy.mjs'; console.log(JSON.stringify(policy('workbuddy-fixture')))")
@@ -234,6 +259,65 @@ def main():
         assert code == 400, code
         assert [b["model"] for b in fixture.calls] == fixture.models, fixture.calls
         passed.append("all unavailable: try the four approved models once each, then stop")
+
+    with gateway(args.magpie, p, args.output) as (port, fixture):
+        fixture.results["gpt-6.1-sol"] = "empty"
+        code, _, text = request(port, "group/auto-gpt-6-1-sol", "empty-baseline", "responses")
+        assert code == 200 and "response.completed" in text and '"output":[]' in text, (code, text)
+        assert "response.output_item.added" not in text, text
+        assert [b["model"] for b in fixture.calls] == ["gpt-6.1-sol"], fixture.calls
+        passed.append("baseline reproduced: unguarded Chat empty HTTP 200 silently completes Responses")
+
+    for result in ("empty", "done-only", "empty-eof", "empty-json"):
+        with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
+            fixture.results["gpt-6.1-sol"] = result
+            code, headers, text = request(port, "group/auto-gpt-6-1-sol", "empty-fallback", "responses")
+            assert code == 200 and '"text":"OK"' in text, (result, code, text)
+            assert text.count("event: response.completed\n") == 1, text
+            assert headers.get("X-Magpie-Model") == "workbuddy-fixture/gpt-6-astra", headers
+            assert [b["model"] for b in fixture.calls] == ["gpt-6.1-sol", "gpt-6-astra"], fixture.calls
+            assert fixture.plugin_sends == ["gpt-6.1-sol", "gpt-6-astra"], fixture.plugin_sends
+            passed.append(f"real loader: {result} fails over from Sol to Astra before response.completed")
+            fixture.calls.clear()
+            request(port, "group/auto-gpt-6-1-sol", "empty-fallback", "responses")
+            assert [b["model"] for b in fixture.calls] == ["gpt-6-astra"], fixture.calls
+    passed.append("empty-reply fallback keeps session affinity on the working model")
+
+    with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
+        fixture.results.update({"gpt-6.1-sol": "empty", "gpt-6-astra": "empty"})
+        code, headers, text = request(port, "workbuddy-fixture/gpt-6.1-sol", "two-empty", "responses")
+        assert code == 200 and '"text":"OK"' in text, (code, text)
+        assert headers.get("X-Magpie-Model") == "workbuddy-fixture/claude-opus-5.5", headers
+        assert fixture.plugin_sends == ["gpt-6.1-sol", "gpt-6-astra", "claude-opus-5.5"], fixture.plugin_sends
+        passed.append("both GPT models empty: the next approved WorkBuddy Opus model answers")
+
+    for result in ("tool", "late-error", "reasoning", "counted-empty"):
+        with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
+            fixture.results["gpt-6.1-sol"] = result
+            code, _, _ = request(port, "workbuddy-fixture/gpt-6.1-sol", "no-replay", "responses", tools=result == "tool")
+            assert code == 200, (result, code)
+            assert fixture.plugin_sends == ["gpt-6.1-sol"], fixture.plugin_sends
+            passed.append(f"real loader: never replay {result}")
+
+    with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
+        fixture.results["claude-opus-5.5"] = "empty"
+        request(port, "workbuddy-fixture/claude-opus-5.5", "claude-empty", "responses")
+        assert fixture.plugin_sends == ["claude-opus-5.5"], fixture.plugin_sends
+        passed.append("Claude's empty end-turn behavior is not globally changed")
+
+    with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
+        fixture.results["gpt-6.1-sol"] = "empty"
+        code, _, text = request(port, "workbuddy-fixture/gpt-6.1-sol", "empty-unscoped", "responses", agent="")
+        assert code == 400 and "workbuddy_empty_reply" in text, (code, text)
+        assert fixture.plugin_sends == ["gpt-6.1-sol"], fixture.plugin_sends
+        passed.append("standalone API: empty reply is an explicit error, not an implicit model switch")
+
+    with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
+        fixture.results.update({model: "empty" if model.startswith("gpt-") else (400, transient) for model in fixture.models})
+        code, _, text = request(port, "group/wb-failover", "empty-all-down", "responses")
+        assert code == 400 and "response.completed" not in text, (code, text)
+        assert fixture.plugin_sends == fixture.models, fixture.plugin_sends
+        passed.append("mixed empty/unavailable pool: exactly four attempts, explicit error, no silent completion")
 
     result = {"passed": len(passed), "checks": passed, "external_model_requests": 0}
     (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")

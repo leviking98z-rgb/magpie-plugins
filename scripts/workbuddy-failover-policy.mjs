@@ -15,7 +15,10 @@ export function policy(provider = "workbuddy-plugin") {
   })
   return {
     groups,
-    pluginOptions: { transientInputFailoverModels: [...models] },
+    pluginOptions: {
+      transientInputFailoverModels: [...models],
+      emptyReplyFailoverModels: ["gpt-6.1-sol", "gpt-6-astra"],
+    },
     modelMapOptions: { agents: ["codex"], mapping, keep_upstream_name: true },
   }
 }

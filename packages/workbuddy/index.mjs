@@ -1589,6 +1589,141 @@ async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequ
   }
 }
 
+const EMPTY_REPLY_PREFIX_LIMIT = 64 * 1024
+
+const populated = (v) => v != null && v !== "" && v !== false &&
+  (Array.isArray(v) ? v.length > 0 : typeof v === "object" ? Object.keys(v).length > 0 : true)
+
+function countedReply(v, depth = 0) {
+  if (v == null || v === 0 || v === "") return false
+  if (typeof v !== "object" || depth >= 8) return true
+  return Object.values(v).some((x) => countedReply(x, depth + 1))
+}
+
+// Only known, uncounted Chat envelopes can be empty. Unknown shapes, refusals,
+// reasoning and even the first tool-call fragment must pass without replay.
+function emptyChat(v) {
+  if (!v || typeof v !== "object" || !Array.isArray(v.choices) || countedReply(v.usage)) return false
+  const metadata = ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"]
+  if (Object.entries(v).some(([k, x]) => !metadata.includes(k) && populated(x))) return false
+  return v.choices.every((c) => {
+    if (!c || typeof c !== "object" || (c.finish_reason != null && c.finish_reason !== "stop")) return false
+    if (Object.entries(c).some(([k, x]) => !["index", "delta", "message", "finish_reason"].includes(k) && populated(x))) return false
+    return [c.delta, c.message].every((at) => at == null || (typeof at === "object" && !Array.isArray(at) &&
+      Object.entries(at).every(([k, x]) => k === "role" || !populated(x))))
+  })
+}
+
+function unavailableEmptyReply(res, format, bytes) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  headers.set("content-type", "application/json")
+  // A synthetic, model-local error: do not rest every WorkBuddy model/account.
+  return new Response(JSON.stringify({ error: {
+    message: "Model temporarily not available: WorkBuddy returned an empty HTTP 200 reply with no token usage",
+    type: "upstream_model_unavailable", code: "workbuddy_empty_reply",
+    upstream_status: res.status, upstream_format: format, upstream_bytes: bytes,
+  } }), { status: 400, statusText: "Bad Request", headers })
+}
+
+// Hold only the small, empty prefix. Once anything might be an answer, restore
+// every original byte and stream the rest; this helper never resends a request.
+async function guardEmptyReply(res, signal) {
+  if (res.status !== 200) return res
+  const type = res.headers.get("content-type") ?? ""
+  const format = /text\/event-stream/i.test(type) ? "sse" : /json/i.test(type) ? "json" : ""
+  if (!format) return res
+  signal?.throwIfAborted()
+  if (!res.body) return unavailableEmptyReply(res, format, 0)
+  const reader = res.body.getReader()
+  const chunks = []
+  const dec = new TextDecoder()
+  let bytes = 0, rest = "", data = [], passthrough = false, released = false
+  const release = () => {
+    if (released) return
+    released = true
+    signal?.removeEventListener("abort", abort)
+    reader.releaseLock()
+  }
+  const cancel = async (reason) => {
+    try { await reader.cancel(reason) } finally { release() }
+  }
+  const abort = () => { void reader.cancel(signal.reason).catch(() => {}) }
+  signal?.addEventListener("abort", abort, { once: true })
+  const inspect = (text) => {
+    if (!text.trim() || (format === "sse" && text.trim() === "[DONE]")) return
+    try { passthrough ||= !emptyChat(JSON.parse(text)) } catch { passthrough = true }
+  }
+  const line = (text) => {
+    if (text.endsWith("\r")) text = text.slice(0, -1)
+    if (!text) {
+      if (data.length) inspect(data.join("\n"))
+      data = []
+    } else if (text === "data" || text.startsWith("data:")) {
+      data.push(text.slice(5).replace(/^ /, ""))
+    }
+  }
+  const scan = (text, done = false) => {
+    rest += text
+    if (format === "json") {
+      if (done) inspect(rest)
+      return
+    }
+    const lines = rest.split("\n")
+    rest = lines.pop()
+    for (const text of lines) line(text)
+    if (done) {
+      line(rest)
+      line("")
+    }
+  }
+  const restored = () => {
+    let at = 0
+    const body = new ReadableStream({
+      async pull(ctl) {
+        try {
+          signal?.throwIfAborted()
+          if (at < chunks.length) {
+            ctl.enqueue(chunks[at++])
+            if (at === chunks.length) { chunks.length = 0; at = 0 }
+            return
+          }
+          const { value, done } = await reader.read()
+          signal?.throwIfAborted()
+          if (done) { release(); ctl.close() } else ctl.enqueue(value)
+        } catch (e) {
+          ctl.error(e)
+          await cancel(e).catch(() => {})
+        }
+      },
+      cancel,
+    })
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers })
+  }
+  try {
+    for (;;) {
+      signal?.throwIfAborted()
+      const { value, done } = await reader.read()
+      signal?.throwIfAborted()
+      if (done) {
+        scan(dec.decode(), true)
+        if (passthrough) return restored()
+        release()
+        return unavailableEmptyReply(res, format, bytes)
+      }
+      chunks.push(value)
+      bytes += value.byteLength
+      if (bytes >= EMPTY_REPLY_PREFIX_LIMIT) return restored()
+      scan(dec.decode(value, { stream: true }))
+      if (passthrough) return restored()
+    }
+  } catch (e) {
+    await cancel(e).catch(() => {})
+    throw e
+  }
+}
+
 // replyAfterTools is a chat ending with tool results then the user's
 // message(s), with an empty assistant message between them, as if the model
 // had said nothing after the results. Tried with a real WorkBuddy AI
@@ -1698,6 +1833,14 @@ function makePlugin(site) {
               } else {
                 res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
               }
+            }
+            const emptyModels = options?.emptyReplyFailoverModels
+            if (Array.isArray(emptyModels) && emptyModels.includes(model)) {
+              const guarded = await guardEmptyReply(res, signal)
+              if (res.status === 200 && guarded.status === 400) {
+                console.warn(`[workbuddy] ${model}: empty HTTP 200 reply; trying a configured fallback if available`)
+              }
+              res = guarded
             }
             return res.status >= 400 ? explained(res) : kept(await renamed(res, fit.names))
           },
@@ -1839,4 +1982,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, INVALID_REQUEST_RETRIES, INVALID_REQUEST_FAILOVER_RETRIES, unavailableInput, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, INVALID_REQUEST_RETRIES, INVALID_REQUEST_FAILOVER_RETRIES, unavailableInput, retryableInvalidRequest, waitForInvalidRequestRetry, retryInvalidRequest, EMPTY_REPLY_PREFIX_LIMIT, emptyChat, guardEmptyReply, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }

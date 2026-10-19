@@ -130,7 +130,10 @@ refusals are not retried here; an exhausted retry budget returns the error.
 When a routing group has alternative models, set this plugin's options:
 
 ```json
-{"transientInputFailoverModels":["gpt-6.1-sol","gpt-6-astra","claude-opus-5.5","claude-opus-5"]}
+{
+  "transientInputFailoverModels": ["gpt-6.1-sol", "gpt-6-astra", "claude-opus-5.5", "claude-opus-5"],
+  "emptyReplyFailoverModels": ["gpt-6.1-sol", "gpt-6-astra"]
+}
 ```
 
 Only those exact upstream model ids use one retry (two sends, 1 second
@@ -145,7 +148,26 @@ The plugin does not select or silently substitute models itself. Configure
 Magpie's ordered routing groups and session affinity to keep the first
 successful model. Existing Magpie handling applies to 429, 5xx and network
 failures; specific validation errors are not turned into availability
-errors. Neither retries nor classification consume a successful stream.
+errors. This rejection classifier does not consume successful streams.
+
+`emptyReplyFailoverModels` separately guards HTTP 200 Chat replies that end
+without output or any token usage. Without this check, an empty WorkBuddy
+Chat stream can become a successful `response.completed` with `output: []`
+at the Responses endpoint, so Codex ends its turn without a final message
+and no failure reaches the routing group. The guard returns a synthetic
+HTTP 400 model-local error (`workbuddy_empty_reply`, `upstream_status: 200`)
+before any response is delivered, allowing the next group member to answer.
+It does not retry the empty request on the same model.
+
+The guard holds at most a 64 KiB prefix (or the read that reaches that
+limit). Text, reasoning, tool-call fragments, refusals, length/filter stops,
+positive usage, unknown formats and larger prefixes pass through without
+replay. Original bytes are restored and remaining output streams normally;
+cancellation stays cancellation. The policy enables this only for the two
+GPT models, not Claude's potentially valid empty end-turn after tool results.
+Outside a routing group, an empty reply becomes an explicit error, not an
+unannounced model substitution. Logs record the model and empty-response
+classification, never prompts or response content.
 
 `scripts/workbuddy-failover-policy.mjs` describes a WorkBuddy-only pool and
 the options for the existing `model-map` middleware, scoped to Codex. It preserves the
@@ -154,6 +176,11 @@ aliases (not other providers or arbitrary groups), and keeps the actual
 served model in replies. `group/wb-failover` starts with GPT-6.1-Sol.
 These groups are for continuity, not single-model benchmark attribution;
 inspect the served model in the routing log when a fallback is used.
+`scripts/workbuddy-failover-smoke.py` exercises empty streams/JSON, fallback
+order, affinity, non-replay and exhaustion against an isolated installed
+Magpie gateway and the real auth loader with fully mocked fetch. Unit tests
+also cover cancellation and stream boundaries. Neither suite needs external
+model requests or credentials.
 
 ## Models
 
