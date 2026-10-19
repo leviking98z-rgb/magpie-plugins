@@ -102,6 +102,29 @@ test("failover never replays successful streams, even an in-stream error", async
   }
 })
 
+test("gateway-managed input failures use exactly one send and no plugin retry", async () => {
+  let calls = 0, waits = 0
+  const res = await retryInvalidRequest(async () => { calls++; return failed() }, body,
+    undefined, async () => { waits++ }, true, true)
+  expect(calls).toBe(1)
+  expect(waits).toBe(0)
+  expect(res.status).toBe(400)
+  expect((await res.json()).error.attempts).toBe(1)
+})
+
+test("gateway-managed mode still rejects specific errors and preserves successful streams", async () => {
+  for (const res of [served(), failed({ ...refusal, extError: { ...refusal.extError, param: "tools" } }),
+    failed({ code: 14018, msg: "Credits exhausted" }), failed(refusal, 429)]) {
+    let calls = 0
+    const got = await retryInvalidRequest(async () => { calls++; return res }, body,
+      undefined, async () => { throw new Error("unexpected retry") }, true, true)
+    expect(got).toBe(res)
+    expect(got.bodyUsed).toBe(false)
+    expect(calls).toBe(1)
+    await got.text()
+  }
+})
+
 test("failover does not reclassify schema, context, auth, quota or transport errors", async () => {
   const responses = [
     failed({ ...refusal, extError: { ...refusal.extError, param: "tools[0]" } }),
@@ -216,6 +239,20 @@ test("retry timers detach cancellation listeners when completed", async () => {
 })
 
 for (const plugin of [WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin]) {
+  test(`${plugin.name || "WorkBuddy"} loader delegates the opted-in model's retry budget to the gateway`, async () => {
+    const originalFetch = globalThis.fetch
+    let sends = 0
+    globalThis.fetch = async () => { sends++; return failed() }
+    try {
+      const hooks = await plugin({ client: {} }, { transientInputFailoverModels: ["gpt-6-astra"], gatewayManagedRetries: true })
+      const loader = await hooks.auth.loader(async () => ({ type: "oauth", access: "fixture", uid: "fixture", expires: Date.now() + 3600_000 }))
+      const res = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body })
+      expect(sends).toBe(1)
+      expect((await res.json()).error.attempts).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
   test(`${plugin.name || "WorkBuddy"} loader opts in only the listed model`, async () => {
     const originalFetch = globalThis.fetch
     const sent = []

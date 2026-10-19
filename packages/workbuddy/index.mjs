@@ -1568,8 +1568,10 @@ function unavailableInput(res, text, attempts) {
   } }), { status: res.status, statusText: res.statusText, headers })
 }
 
-async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequestRetry, failover = false) {
-  const retries = failover === true ? INVALID_REQUEST_FAILOVER_RETRIES : INVALID_REQUEST_RETRIES
+async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequestRetry, failover = false, gatewayManaged = false) {
+  // The companion gateway knows whether this request is a group or a direct
+  // model. Let it own the budget rather than multiplying two retry loops.
+  const retries = failover === true ? (gatewayManaged === true ? 0 : INVALID_REQUEST_FAILOVER_RETRIES) : INVALID_REQUEST_RETRIES
   for (let attempt = 0; ; attempt++) {
     signal?.throwIfAborted()
     const res = await send(body)
@@ -1580,7 +1582,7 @@ async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequ
     await res.body?.cancel()
     signal?.throwIfAborted()
     if (attempt === retries) {
-      console.warn(`[workbuddy] transient upstream 11133 after ${attempt + 1} attempts; trying a configured fallback if available`)
+      console.warn(`[workbuddy] transient upstream 11133 after ${attempt + 1} attempts; gateway will retry or try a configured fallback`)
       return unavailableInput(res, text, attempt + 1)
     }
     const delay = Math.min(1000 * 2 ** attempt, 5000)
@@ -1814,7 +1816,7 @@ function makePlugin(site) {
               retryInvalidRequest((payload) =>
                 fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: payload, signal })
                   .catch((e) => unanswered(site, a, payload, e, signal)), b, signal,
-                waitForInvalidRequestRetry, failover)
+                waitForInvalidRequestRetry, failover, options?.gatewayManagedRetries === true)
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
             const model = chatOf(body)?.model

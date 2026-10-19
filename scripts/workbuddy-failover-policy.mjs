@@ -16,6 +16,7 @@ export function policy(provider = "workbuddy-plugin") {
   return {
     groups,
     pluginOptions: {
+      gatewayManagedRetries: true,
       transientInputFailoverModels: [...models],
       emptyReplyFailoverModels: ["gpt-6.1-sol", "gpt-6-astra"],
     },

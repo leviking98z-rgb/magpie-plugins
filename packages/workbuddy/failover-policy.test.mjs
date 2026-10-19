@@ -6,6 +6,7 @@ test("the approved family has exactly four WorkBuddy models, Astra not Sol 6", (
   expect(models).toEqual(["gpt-6.1-sol", "gpt-6-astra", "claude-opus-5.5", "claude-opus-5"])
   const p = policy()
   expect(p.pluginOptions.transientInputFailoverModels).toEqual(models)
+  expect(p.pluginOptions.gatewayManagedRetries).toBe(true)
   expect(p.pluginOptions.emptyReplyFailoverModels).toEqual(["gpt-6.1-sol", "gpt-6-astra"])
   expect(p.groups).toHaveLength(4)
   for (const [index, g] of p.groups.entries()) {

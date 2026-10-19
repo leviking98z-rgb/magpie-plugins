@@ -127,22 +127,30 @@ refusals are not retried here; an exhausted retry budget returns the error.
 
 ### Opt-in model failover in Magpie
 
-When a routing group has alternative models, set this plugin's options:
+With the companion Magpie gateway patch installed, set this plugin's options:
 
 ```json
 {
+  "gatewayManagedRetries": true,
   "transientInputFailoverModels": ["gpt-6.1-sol", "gpt-6-astra", "claude-opus-5.5", "claude-opus-5"],
   "emptyReplyFailoverModels": ["gpt-6.1-sol", "gpt-6-astra"]
 }
 ```
 
-Only those exact upstream model ids use one retry (two sends, 1 second
-apart) for the generic `11133` above. A second identical rejection is
-returned as a model-local availability error, with the original HTTP 400,
-upstream error, request-id header and attempt count preserved. Magpie can
-then try the next configured group member and cool down the failed model,
-not the whole WorkBuddy account. This is a routing policy, not proof that
-the upstream is overloaded. An unlisted model keeps the ten-retry policy.
+With `gatewayManagedRetries: true`, those exact upstream model ids send
+only once in the plugin. A matching generic `11133` is returned as a
+model-local availability error, preserving HTTP 400 and the upstream
+error. The patched gateway knows the route: a direct model is retried up
+to ten times (eleven total sends), while a group moves to its next member.
+This avoids mistaking a direct selection for a group just because its model
+appears in `transientInputFailoverModels`, and avoids multiplying plugin and
+gateway retry loops. Specific validation errors remain non-retryable.
+
+Without this new option, the legacy opt-in uses one plugin retry (two sends)
+before returning its availability error. An unlisted model keeps the
+plugin's ten-retry policy. Do not enable gateway-managed mode on an
+unpatched gateway: it cannot retry the synthetic 400 for a direct model.
+This is a routing policy, not proof that the upstream is overloaded.
 
 The plugin does not select or silently substitute models itself. Configure
 Magpie's ordered routing groups and session affinity to keep the first
@@ -158,9 +166,9 @@ and no failure reaches the routing group. The guard returns a synthetic
 HTTP 502 empty-reply error (`workbuddy_empty_reply`, `upstream_status: 200`)
 before any response is delivered. Magpie's native empty-reply handling tries
 the next group member without resting the whole account. The companion
-gateway patch (`standaloneEmptyRetries` in Magpie's `internal/gateway/fallback.go`)
-retries a standalone model at most five times, six sends including the initial
-request, with pauses of 1, 2, 4, 5 and 5 seconds. Exhaustion returns an explicit
+gateway patch (`standaloneWorkBuddyRetries` in Magpie's `internal/gateway/fallback.go`)
+retries a standalone model at most ten times, eleven sends including the initial
+request, with pauses of 1, 2, 4, then at most 5 seconds. Exhaustion returns an explicit
 error. This is a native gateway change, not a plugin option: unpatched Magpie
 0.1.1268 only retries twice. Groups retain their existing model switching,
 last-candidate retry budget and patience settings. The plugin itself never
@@ -186,7 +194,7 @@ These groups are for continuity, not single-model benchmark attribution;
 inspect the served model in the routing log when a fallback is used.
 `scripts/workbuddy-failover-smoke.py` exercises empty streams/JSON, fallback
 order, affinity, non-replay and exhaustion against an isolated installed
-Magpie gateway (with the companion five-retry patch) and the real auth loader
+Magpie gateway (with the companion ten-retry patch) and the real auth loader
 with fully mocked fetch. Unit tests
 also cover cancellation and stream boundaries. Neither suite needs external
 model requests or credentials.

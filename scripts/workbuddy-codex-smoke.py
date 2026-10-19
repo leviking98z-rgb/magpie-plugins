@@ -43,7 +43,7 @@ stream_max_retries = 0
         result = subprocess.run([
             binary, "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only",
             "Reply with exactly OK. Do not use tools.",
-        ], env=env, cwd=home, capture_output=True, text=True, timeout=60)
+        ], env=env, cwd=home, capture_output=True, text=True, timeout=180)
         (output / "client.jsonl").write_text(result.stdout)
         (output / "client.stderr").write_text(result.stderr)
         events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
@@ -63,7 +63,8 @@ def main():
     p = smoke.node_json("import {policy} from './scripts/workbuddy-failover-policy.mjs'; console.log(JSON.stringify(policy('workbuddy-fixture')))")
     results = []
     cases = [("failover", args.plugin), ("standalone-recovery", args.plugin),
-             ("standalone-exhausted", args.plugin)]
+             ("standalone-exhausted", args.plugin), ("input-failover", args.plugin),
+             ("standalone-input-recovery", args.plugin), ("standalone-input-exhausted", args.plugin)]
     if args.baseline_plugin:
         cases.insert(0, ("baseline", args.baseline_plugin))
     for label, plugin in cases:
@@ -72,25 +73,40 @@ def main():
         model = "group/auto-gpt-6-1-sol"
         if label.startswith("standalone"):
             model = "workbuddy-fixture/gpt-6.1-sol"
+        upstream = "gpt-6.1-sol"
+        if "input" in label:
+            upstream = "gpt-6-astra"
+            model = ("workbuddy-fixture/gpt-6-astra" if label.startswith("standalone")
+                     else "group/auto-gpt-6-astra")
         with smoke.gateway(args.magpie, p, output, plugin) as (port, fixture):
-            fixture.results["gpt-6.1-sol"] = (["workbuddy-empty"] * 5 + ["ok"]
-                                            if label == "standalone-recovery" else "workbuddy-empty")
+            failure = (400, smoke.REFUSAL) if "input" in label else "workbuddy-empty"
+            fixture.results[upstream] = [failure] * 10 + ["ok"] if label.endswith("recovery") else failure
+            if "standalone-input" in label:
+                fixture.results[upstream] = ["slow-input"] + [failure] * 9 + (["ok"] if label.endswith("recovery") else [failure])
             code, events, messages = run_client(args.codex, port, output, model)
             tried = [b["model"] for b in fixture.calls]
-        if label == "standalone-exhausted":
+            sends = fixture.plugin_sends[:]
+        if label.endswith("exhausted"):
             assert code != 0 and not messages, (label, code, events)
             assert any(e.get("type") == "turn.failed" for e in events), events
             assert not any(e.get("type") == "turn.completed" for e in events), events
-            assert tried == ["gpt-6.1-sol"] * 6, tried
+            assert tried == [upstream] * 11, tried
         elif label == "baseline":
             assert code == 0, (label, code, events)
             assert not messages and tried == ["gpt-6.1-sol"], (messages, tried)
         else:
             assert code == 0, (label, code, events)
             assert messages == ["OK"], (messages, events)
-            expected = (["gpt-6.1-sol"] * 6 if label == "standalone-recovery"
-                        else ["gpt-6.1-sol", "gpt-6-astra"])
+            expected = ([upstream] * 11 if label.endswith("recovery")
+                        else [upstream, "gpt-6.1-sol" if upstream == "gpt-6-astra" else "gpt-6-astra"])
             assert tried == expected, tried
+            if "failover" in label:
+                stderr = (output / "client.stderr").read_text()
+                assert "Failover:" in stderr and "Routing group unchanged." in stderr, stderr
+                assert "high-risk cyber" not in stderr, stderr
+                assert not any(e.get("item", {}).get("type") == "error" for e in events), events
+        if label != "baseline":
+            assert sends == tried, (sends, tried)
         results.append({"case": label, "exit": code, "messages": messages, "attempted_models": tried})
     result = {"checks": results, "external_model_requests": 0}
     (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
