@@ -157,9 +157,13 @@ at the Responses endpoint, so Codex ends its turn without a final message
 and no failure reaches the routing group. The guard returns a synthetic
 HTTP 502 empty-reply error (`workbuddy_empty_reply`, `upstream_status: 200`)
 before any response is delivered. Magpie's native empty-reply handling tries
-the next group member without resting the whole account. With no alternative
-left (including a standalone model), Magpie retries the same model twice,
-after 1 and 2 seconds, then returns an explicit error. The plugin itself never
+the next group member without resting the whole account. The companion
+gateway patch (`standaloneEmptyRetries` in Magpie's `internal/gateway/fallback.go`)
+retries a standalone model at most five times, six sends including the initial
+request, with pauses of 1, 2, 4, 5 and 5 seconds. Exhaustion returns an explicit
+error. This is a native gateway change, not a plugin option: unpatched Magpie
+0.1.1268 only retries twice. Groups retain their existing model switching,
+last-candidate retry budget and patience settings. The plugin itself never
 resends an empty request, so it cannot multiply the gateway's retry budget.
 
 The guard holds at most a 64 KiB prefix (or the read that reaches that
@@ -182,7 +186,8 @@ These groups are for continuity, not single-model benchmark attribution;
 inspect the served model in the routing log when a fallback is used.
 `scripts/workbuddy-failover-smoke.py` exercises empty streams/JSON, fallback
 order, affinity, non-replay and exhaustion against an isolated installed
-Magpie gateway and the real auth loader with fully mocked fetch. Unit tests
+Magpie gateway (with the companion five-retry patch) and the real auth loader
+with fully mocked fetch. Unit tests
 also cover cancellation and stream boundaries. Neither suite needs external
 model requests or credentials.
 `scripts/workbuddy-codex-smoke.py` additionally runs an isolated real Codex

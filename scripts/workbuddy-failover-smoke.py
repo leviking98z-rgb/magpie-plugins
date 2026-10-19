@@ -201,7 +201,7 @@ def request(port, model, session, protocol="chat", tools=False, agent="codex"):
         "content-type": "application/json", "authorization": "Bearer magpie" + (f"-{agent}" if agent else ""), "session_id": session,
     })
     try:
-        response = urllib.request.urlopen(req, timeout=15)
+        response = urllib.request.urlopen(req, timeout=60)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -320,16 +320,16 @@ def main():
         fixture.results["gpt-6.1-sol"] = "empty"
         code, _, text = request(port, "workbuddy-fixture/gpt-6.1-sol", "empty-unscoped", "responses")
         assert code == 502 and "an empty reply" in text and "response.completed" not in text, (code, text)
-        assert fixture.plugin_sends == ["gpt-6.1-sol"] * 3, fixture.plugin_sends
-        passed.append("standalone API: two same-model retries, then an explicit 502; no silent completion")
+        assert fixture.plugin_sends == ["gpt-6.1-sol"] * 6, fixture.plugin_sends
+        passed.append("standalone API: five same-model retries, then an explicit 502; no silent completion")
 
     with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
-        fixture.results["gpt-6.1-sol"] = ["workbuddy-empty", "ok"]
+        fixture.results["gpt-6.1-sol"] = ["workbuddy-empty"] * 5 + ["ok"]
         code, headers, text = request(port, "workbuddy-fixture/gpt-6.1-sol", "empty-recovery", "responses")
         assert code == 200 and '"text":"OK"' in text, (code, text)
         assert headers.get("X-Magpie-Model") == "workbuddy-fixture/gpt-6.1-sol", headers
-        assert fixture.plugin_sends == ["gpt-6.1-sol"] * 2, fixture.plugin_sends
-        passed.append("standalone API: an empty response retries the selected model and recovers")
+        assert fixture.plugin_sends == ["gpt-6.1-sol"] * 6, fixture.plugin_sends
+        passed.append("standalone API: the fifth retry recovers on the selected model")
 
     with gateway(args.magpie, p, args.output, args.workbuddy_plugin) as (port, fixture):
         fixture.results["gpt-6.1-sol"] = "workbuddy-empty"

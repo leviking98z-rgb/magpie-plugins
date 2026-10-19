@@ -73,7 +73,7 @@ def main():
         if label.startswith("standalone"):
             model = "workbuddy-fixture/gpt-6.1-sol"
         with smoke.gateway(args.magpie, p, output, plugin) as (port, fixture):
-            fixture.results["gpt-6.1-sol"] = (["workbuddy-empty", "ok"]
+            fixture.results["gpt-6.1-sol"] = (["workbuddy-empty"] * 5 + ["ok"]
                                             if label == "standalone-recovery" else "workbuddy-empty")
             code, events, messages = run_client(args.codex, port, output, model)
             tried = [b["model"] for b in fixture.calls]
@@ -81,14 +81,14 @@ def main():
             assert code != 0 and not messages, (label, code, events)
             assert any(e.get("type") == "turn.failed" for e in events), events
             assert not any(e.get("type") == "turn.completed" for e in events), events
-            assert tried == ["gpt-6.1-sol"] * 3, tried
+            assert tried == ["gpt-6.1-sol"] * 6, tried
         elif label == "baseline":
             assert code == 0, (label, code, events)
             assert not messages and tried == ["gpt-6.1-sol"], (messages, tried)
         else:
             assert code == 0, (label, code, events)
             assert messages == ["OK"], (messages, events)
-            expected = (["gpt-6.1-sol"] * 2 if label == "standalone-recovery"
+            expected = (["gpt-6.1-sol"] * 6 if label == "standalone-recovery"
                         else ["gpt-6.1-sol", "gpt-6-astra"])
             assert tried == expected, tried
         results.append({"case": label, "exit": code, "messages": messages, "attempted_models": tried})
