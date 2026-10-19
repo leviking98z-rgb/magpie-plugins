@@ -31,7 +31,8 @@ test("mapping opts in only the pool's aliases, preserving the selected primary",
     const original = model.replace(/^workbuddy-plugin\//, "").replace(/^group\/auto-/, "").replace("gpt-6-1-sol", "gpt-6.1-sol")
     expect(group.members[0]).toBe(`workbuddy-plugin/${original}`)
   }
-  for (const model of ["workbuddy-plugin/gpt-6-sol", "group/auto-gpt-6-sol", "codex/gpt-6-astra", "other/gpt-6-astra",
+  for (const model of [...models, ...models.map((m) => `workbuddy-plugin/${m}`),
+    "workbuddy-plugin/gpt-6-sol", "group/auto-gpt-6-sol", "codex/gpt-6-astra", "other/gpt-6-astra",
     "workbuddy-plugin/kimi-k3-1", "group/group", "group/my-strict-benchmark", "group/wb-failover",
   ]) expect(onRequest({ model }, { agent: "codex", options: p.modelMapOptions, state: {} })).toBeUndefined()
 })
@@ -48,7 +49,7 @@ test("standalone API and other agents' benchmark requests are not opted in", () 
 test("the middleware leaves the actual fallback model visible in every reply", () => {
   const p = policy()
   const ctx = { agent: "codex", options: p.modelMapOptions, state: {}, status: 200 }
-  onRequest({ model: "workbuddy-plugin/gpt-6-astra" }, ctx)
+  onRequest({ model: "group/auto-gpt-6-astra" }, ctx)
   for (const event of [{ model: "claude-opus-5.5" }, { response: { model: "claude-opus-5.5" } },
     { type: "message_start", message: { model: "claude-opus-5.5" } },
   ]) {

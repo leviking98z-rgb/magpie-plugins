@@ -5,7 +5,7 @@ export function policy(provider = "workbuddy-plugin") {
   const groups = models.map((primary, index) => {
     const id = index === 0 ? "wb-failover" : `wb-failover-${primary.replaceAll(".", "-")}`
     const target = `group/${id}`
-    mapping[primary] = mapping[`${provider}/${primary}`] = target
+    // Direct model selections stay single-model; only group aliases opt in.
     if (primary.startsWith("gpt-")) mapping[`group/auto-${primary.replaceAll(".", "-")}`] = target
     return {
       id, name: `WorkBuddy Failover / ${primary}`,

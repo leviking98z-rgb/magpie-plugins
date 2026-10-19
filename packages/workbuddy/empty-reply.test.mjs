@@ -26,13 +26,19 @@ for (const [name, text] of [
   ["zero usage", frame(event({}, "stop", { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 })) + done],
   ["empty choices", frame({ choices: [], usage: { total_tokens: 0 } }) + done],
   ["empty EOF without delimiter", frame(event()).trimEnd()],
+  ["pending empty finish reason", frame(event({}, "")) + frame(event()) + done],
+  ["only empty finish reasons", frame(event({}, "")) + done],
+  ["prompt counted but no answer", frame(event({}, "stop", { prompt_tokens: 100, completion_tokens: 0 })) + done],
+  ["output counted but not delivered", frame(event({}, "stop", { prompt_tokens: 100, completion_tokens: 1 })) + done],
+  ["cached usage only", frame(event({}, "stop", { prompt_tokens_details: { cached_tokens: 5 } })) + done],
+  ["reasoning usage without reasoning", frame(event({}, "stop", { completion_tokens_details: { reasoning_tokens: 5 } })) + done],
 ]) {
-  test(`an uncounted empty SSE reply becomes a model-local failure: ${name}`, async () => {
+  test(`an empty SSE reply becomes a model-local failure: ${name}`, async () => {
     const res = await guardEmptyReply(response(text))
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(502)
     expect(res.headers.get("x-request-id")).toBe("fixture-request")
     expect(await res.json()).toEqual({ error: {
-      message: "Model temporarily not available: WorkBuddy returned an empty HTTP 200 reply with no token usage",
+      message: "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
       type: "upstream_model_unavailable", code: "workbuddy_empty_reply",
       upstream_status: 200, upstream_format: "sse", upstream_bytes: enc.encode(text).byteLength,
     } })
@@ -45,7 +51,7 @@ test("empty JSON and a missing body are detected; stale encoding headers are rem
     source.headers.set("content-length", "999")
     source.headers.set("content-encoding", "gzip")
     const res = await guardEmptyReply(source)
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(502)
     expect(res.headers.has("content-length")).toBe(false)
     expect(res.headers.has("content-encoding")).toBe(false)
     expect((await res.json()).error.upstream_format).toBe("json")
@@ -56,7 +62,7 @@ test("SSE framing tolerates arbitrary byte splits, CRLF and multiline data", asy
   const text = `: ping\r\nevent: message\r\ndata: {"choices":\r\ndata: [{"delta":{},"finish_reason":"stop"}]}\r\n\r\n${done}`
   for (const size of [1, 2, 7, 64]) {
     const res = await guardEmptyReply(response(chunked(enc.encode(text), size)))
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(502)
     await res.text()
   }
 })
@@ -70,9 +76,6 @@ for (const [name, v] of [
   ["refusal", event({ refusal: "Cannot comply" })], ["image", event({ images: [{ url: "fixture" }] })],
   ["length stop", event({}, "length")], ["filter stop", event({}, "content_filter")],
   ["tool stop", event({}, "tool_calls")],
-  ["counted empty end-turn", event({}, "stop", { prompt_tokens: 100, completion_tokens: 1 })],
-  ["cached usage", event({}, "stop", { prompt_tokens_details: { cached_tokens: 5 } })],
-  ["reasoning usage", event({}, "stop", { completion_tokens_details: { reasoning_tokens: 5 } })],
   ["stream error", { error: { message: "upstream failed", type: "server_error" } }],
   ["vendor refusal", { code: 11140, msg: "Account restricted" }],
   ["unknown protocol", { type: "response.completed", response: { output: [] } }],
@@ -91,6 +94,53 @@ for (const [name, v] of [
     expect(await whole.text()).toBe(json)
   })
 }
+
+// Sanitized field layout from a live WorkBuddy stream, not an idealized Chat chunk.
+const workbuddyEvent = (delta = {}, finish = "", usage = {}) => ({
+  id: "fixture", model: "gpt-6.1-sol", object: "response", created: 1,
+  choices: [{ index: 0, delta: {
+    content: "", reasoning_content: "", function_call: null, refusal: "",
+    tool_calls: [], extra_fields: null, ...delta,
+  }, logprobs: null, finish_reason: finish }],
+  usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0,
+    completion_tokens_details: null,
+    prompt_tokens_details: { accepted_prediction_tokens: 0, audio_tokens: 0,
+      reasoning_tokens: 0, rejected_prediction_tokens: 0, cached_tokens: 0 },
+    prompt_cache_hit_tokens: 0, prompt_cache_miss_tokens: 0, cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0, prompt_cache_write_tokens: 0,
+    completion_thinking_tokens: 0, credit: 0, cached_tokens: 0, ...usage },
+})
+
+test("real WorkBuddy pending frames do not prematurely disable empty detection", async () => {
+  const text = frame(workbuddyEvent()) + frame(workbuddyEvent({ role: "assistant" }, "stop")) + done
+  for (const size of [1, 7, 256, enc.encode(text).byteLength]) {
+    const res = await guardEmptyReply(response(chunked(enc.encode(text), size)))
+    expect(res.status).toBe(502)
+    expect((await res.json()).error.code).toBe("workbuddy_empty_reply")
+  }
+})
+
+test("pending and accounting frames are held until actual output without changing bytes", async () => {
+  for (const delta of [{ content: "OK" }, { reasoning_content: "Thinking" },
+    { tool_calls: [{ index: 0, id: "call_1" }] }, { refusal: "No" }]) {
+    let ctl
+    const prefix = enc.encode(frame(workbuddyEvent({}, "", { prompt_tokens: 100 })))
+    let released = false
+    const pending = guardEmptyReply(response(new ReadableStream({
+      start(c) { ctl = c; c.enqueue(prefix) },
+    }))).then((res) => { released = true; return res })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(released).toBe(false)
+    const content = enc.encode(frame(workbuddyEvent(delta)))
+    ctl.enqueue(content)
+    const res = await pending
+    expect(res.status).toBe(200)
+    const reader = res.body.getReader()
+    expect((await reader.read()).value).toEqual(prefix)
+    expect((await reader.read()).value).toEqual(content)
+    await reader.cancel()
+  }
+})
 
 test("non-200 and non-Chat content types are untouched, including their unread bodies", async () => {
   for (const res of [new Response("busy", { status: 503 }), response("", "text/plain"),
@@ -233,7 +283,7 @@ for (const plugin of [WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin]) {
         const body = JSON.stringify({ model, stream: true, messages: [{ role: "user", content: "Reply OK" }] })
         const res = await loader.fetch(loader.baseURL + "/chat/completions", { method: "POST", body })
         expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
-        expect(res.status).toBe(model === "gpt-6.1-sol" ? 400 : 200)
+        expect(res.status).toBe(model === "gpt-6.1-sol" ? 502 : 200)
         await res.text()
       }
       expect(sent.map((b) => b.model)).toEqual(["gpt-6.1-sol", "gpt-6-astra", "claude-opus-5.5", "kimi-k3-1"])

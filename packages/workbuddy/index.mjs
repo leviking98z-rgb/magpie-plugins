@@ -1594,20 +1594,15 @@ const EMPTY_REPLY_PREFIX_LIMIT = 64 * 1024
 const populated = (v) => v != null && v !== "" && v !== false &&
   (Array.isArray(v) ? v.length > 0 : typeof v === "object" ? Object.keys(v).length > 0 : true)
 
-function countedReply(v, depth = 0) {
-  if (v == null || v === 0 || v === "") return false
-  if (typeof v !== "object" || depth >= 8) return true
-  return Object.values(v).some((x) => countedReply(x, depth + 1))
-}
-
-// Only known, uncounted Chat envelopes can be empty. Unknown shapes, refusals,
-// reasoning and even the first tool-call fragment must pass without replay.
+// Accounting and pending finish_reason: "" frames are not output. WorkBuddy
+// sends these before any answer; releasing the guard there hides an empty end.
+// Unknown shapes, refusals, reasoning and tool fragments still prevent replay.
 function emptyChat(v) {
-  if (!v || typeof v !== "object" || !Array.isArray(v.choices) || countedReply(v.usage)) return false
+  if (!v || typeof v !== "object" || !Array.isArray(v.choices)) return false
   const metadata = ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"]
   if (Object.entries(v).some(([k, x]) => !metadata.includes(k) && populated(x))) return false
   return v.choices.every((c) => {
-    if (!c || typeof c !== "object" || (c.finish_reason != null && c.finish_reason !== "stop")) return false
+    if (!c || typeof c !== "object" || (c.finish_reason != null && c.finish_reason !== "" && c.finish_reason !== "stop")) return false
     if (Object.entries(c).some(([k, x]) => !["index", "delta", "message", "finish_reason"].includes(k) && populated(x))) return false
     return [c.delta, c.message].every((at) => at == null || (typeof at === "object" && !Array.isArray(at) &&
       Object.entries(at).every(([k, x]) => k === "role" || !populated(x))))
@@ -1619,12 +1614,13 @@ function unavailableEmptyReply(res, format, bytes) {
   headers.delete("content-length")
   headers.delete("content-encoding")
   headers.set("content-type", "application/json")
-  // A synthetic, model-local error: do not rest every WorkBuddy model/account.
+  // Use Magpie's native empty-reply classification: another group member
+  // answers without resting the account, or a standalone model retries 502.
   return new Response(JSON.stringify({ error: {
-    message: "Model temporarily not available: WorkBuddy returned an empty HTTP 200 reply with no token usage",
+    message: "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
     type: "upstream_model_unavailable", code: "workbuddy_empty_reply",
     upstream_status: res.status, upstream_format: format, upstream_bytes: bytes,
-  } }), { status: 400, statusText: "Bad Request", headers })
+  } }), { status: 502, statusText: "Bad Gateway", headers })
 }
 
 // Hold only the small, empty prefix. Once anything might be an answer, restore
@@ -1837,8 +1833,8 @@ function makePlugin(site) {
             const emptyModels = options?.emptyReplyFailoverModels
             if (Array.isArray(emptyModels) && emptyModels.includes(model)) {
               const guarded = await guardEmptyReply(res, signal)
-              if (res.status === 200 && guarded.status === 400) {
-                console.warn(`[workbuddy] ${model}: empty HTTP 200 reply; trying a configured fallback if available`)
+              if (res.status === 200 && guarded.status === 502) {
+                console.warn(`[workbuddy] ${model}: empty HTTP 200 reply; gateway will retry or try a configured fallback`)
               }
               res = guarded
             }
