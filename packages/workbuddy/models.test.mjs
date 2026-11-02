@@ -70,7 +70,9 @@ test("the loader sends GPT-5.6-Sol max unchanged", async () => {
   globalThis.fetch = async (url, init) => {
     assert.equal(String(url), "https://copilot.tencent.com/v2/chat/completions")
     sent = JSON.parse(init.body)
-    return new Response("data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+    return new Response('data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+      headers: { "content-type": "text/event-stream" },
+    })
   }
   const hooks = await WorkBuddyAuthPlugin({ client: {} })
   const loader = await hooks.auth.loader(async () => auth)

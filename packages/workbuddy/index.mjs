@@ -1595,6 +1595,7 @@ async function retryInvalidRequest(send, body, signal, wait = waitForInvalidRequ
 }
 
 const EMPTY_REPLY_PREFIX_LIMIT = 64 * 1024
+const ANSWER_REPLY_PREFIX_LIMIT = 4 * 1024 * 1024
 
 const populated = (v) => v != null && v !== "" && v !== false &&
   (Array.isArray(v) ? v.length > 0 : typeof v === "object" ? Object.keys(v).length > 0 : true)
@@ -1602,7 +1603,8 @@ const populated = (v) => v != null && v !== "" && v !== false &&
 // Accounting and pending finish_reason: "" frames are not output. WorkBuddy
 // sends these before any answer; releasing the guard there hides an empty end.
 // Unknown shapes, refusals, reasoning and tool fragments still prevent replay.
-function emptyChat(v) {
+// With requireAnswer, recognized reasoning is held until actionable output.
+function emptyChat(v, requireAnswer = false) {
   if (!v || typeof v !== "object" || !Array.isArray(v.choices)) return false
   const metadata = ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"]
   if (Object.entries(v).some(([k, x]) => !metadata.includes(k) && populated(x))) return false
@@ -1610,11 +1612,12 @@ function emptyChat(v) {
     if (!c || typeof c !== "object" || (c.finish_reason != null && c.finish_reason !== "" && c.finish_reason !== "stop")) return false
     if (Object.entries(c).some(([k, x]) => !["index", "delta", "message", "finish_reason"].includes(k) && populated(x))) return false
     return [c.delta, c.message].every((at) => at == null || (typeof at === "object" && !Array.isArray(at) &&
-      Object.entries(at).every(([k, x]) => k === "role" || !populated(x))))
+      Object.entries(at).every(([k, x]) => k === "role" || !populated(x) ||
+        (requireAnswer && ["reasoning_content", "reasoning"].includes(k) && typeof x === "string"))))
   })
 }
 
-function unavailableEmptyReply(res, format, bytes) {
+function unavailableEmptyReply(res, format, bytes, prefixLimited = false) {
   const headers = new Headers(res.headers)
   headers.delete("content-length")
   headers.delete("content-encoding")
@@ -1622,15 +1625,17 @@ function unavailableEmptyReply(res, format, bytes) {
   // Use Magpie's native empty-reply classification: another group member
   // answers without resting the account, or a standalone model retries 502.
   return new Response(JSON.stringify({ error: {
-    message: "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
-    type: "upstream_model_unavailable", code: "workbuddy_empty_reply",
+    message: prefixLimited
+      ? "WorkBuddy: the pending reply exceeded its buffer limit before an answer or tool call; retry the same model"
+      : "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
+    type: "upstream_model_unavailable", code: prefixLimited ? "workbuddy_pending_output_limit" : "workbuddy_empty_reply",
     upstream_status: res.status, upstream_format: format, upstream_bytes: bytes,
   } }), { status: 502, statusText: "Bad Gateway", headers })
 }
 
 // Hold only the small, empty prefix. Once anything might be an answer, restore
 // every original byte and stream the rest; this helper never resends a request.
-async function guardEmptyReply(res, signal) {
+async function guardEmptyReply(res, signal, { requireAnswer = false } = {}) {
   if (res.status !== 200) return res
   const type = res.headers.get("content-type") ?? ""
   const format = /text\/event-stream/i.test(type) ? "sse" : /json/i.test(type) ? "json" : ""
@@ -1654,7 +1659,7 @@ async function guardEmptyReply(res, signal) {
   signal?.addEventListener("abort", abort, { once: true })
   const inspect = (text) => {
     if (!text.trim() || (format === "sse" && text.trim() === "[DONE]")) return
-    try { passthrough ||= !emptyChat(JSON.parse(text)) } catch { passthrough = true }
+    try { passthrough ||= !emptyChat(JSON.parse(text), requireAnswer) } catch { passthrough = true }
   }
   const line = (text) => {
     if (text.endsWith("\r")) text = text.slice(0, -1)
@@ -1715,9 +1720,16 @@ async function guardEmptyReply(res, signal) {
       }
       chunks.push(value)
       bytes += value.byteLength
-      if (bytes >= EMPTY_REPLY_PREFIX_LIMIT) return restored()
       scan(dec.decode(value, { stream: true }))
       if (passthrough) return restored()
+      const limit = requireAnswer ? ANSWER_REPLY_PREFIX_LIMIT : EMPTY_REPLY_PREFIX_LIMIT
+      if (bytes >= limit) {
+        if (!requireAnswer) return restored()
+        // No actionable output has escaped, so a failed pending reply is safe
+        // to retry. Do not release reasoning alone as a successful empty turn.
+        await cancel()
+        return unavailableEmptyReply(res, format, bytes, true)
+      }
     }
   } catch (e) {
     await cancel(e).catch(() => {})
@@ -1836,10 +1848,16 @@ function makePlugin(site) {
               }
             }
             const emptyModels = options?.emptyReplyFailoverModels
-            if (Array.isArray(emptyModels) && emptyModels.includes(model)) {
-              const guarded = await guardEmptyReply(res, signal)
+            // GPT-5.6-Sol can end a tool continuation with reasoning alone.
+            // Hold that reasoning until an answer or tool fragment arrives;
+            // otherwise the gateway retries this same model before Codex ends.
+            const requireAnswer = site.id === "workbuddy" && model === "gpt-5.6-sol"
+            if (requireAnswer || (Array.isArray(emptyModels) && emptyModels.includes(model))) {
+              const guarded = await guardEmptyReply(res, signal, { requireAnswer })
               if (res.status === 200 && guarded.status === 502) {
-                console.warn(`[workbuddy] ${model}: empty HTTP 200 reply; gateway will retry or try a configured fallback`)
+                console.warn(requireAnswer
+                  ? `[workbuddy] ${model}: no answer or tool call in HTTP 200 reply; gateway will retry the same model`
+                  : `[workbuddy] ${model}: empty HTTP 200 reply; gateway will retry or try a configured fallback`)
               }
               res = guarded
             }
