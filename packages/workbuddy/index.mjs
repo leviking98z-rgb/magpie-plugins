@@ -1607,6 +1607,26 @@ const populated = (v) => v != null && v !== "" && v !== false &&
 // With requireAnswer, recognized reasoning is held until actionable output.
 function emptyChat(v, requireAnswer = false) {
   if (!v || typeof v !== "object" || !Array.isArray(v.choices)) return false
+  if (requireAnswer) {
+    // Codex's Chat decoder can act only on text and tool_calls. WorkBuddy may
+    // put internal reasoning metadata in extra/unknown fields; releasing on
+    // those makes the gateway finish a successful turn with no item at all.
+    // Hold every valid Chat frame until a supported answer, tool fragment, or
+    // non-stop terminal reason arrives. A top-level error remains an error.
+    if (populated(v.error)) return false
+    return v.choices.every((c) => {
+      if (!c || typeof c !== "object") return false
+      if (c.finish_reason != null && c.finish_reason !== "" && c.finish_reason !== "stop") return false
+      return [c.delta, c.message].every((at) => {
+        if (at == null) return true
+        if (typeof at !== "object" || Array.isArray(at)) return false
+        const thought = at.extra_content?.google?.thought === true
+        if (!thought && populated(at.content)) return false
+        if (populated(at.tool_calls)) return false
+        return true
+      })
+    })
+  }
   const metadata = ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"]
   if (Object.entries(v).some(([k, x]) => !metadata.includes(k) && populated(x))) return false
   return v.choices.every((c) => {
@@ -1629,7 +1649,7 @@ function unavailableEmptyReply(res, format, bytes, prefixLimited = false, answer
     message: prefixLimited
       ? "WorkBuddy: the pending reply exceeded its buffer limit before an answer or tool call; retry the same model"
       : answerRequired
-        ? "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no answer or tool call"
+        ? "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output (no answer or tool call)"
         : "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
     type: "upstream_model_unavailable", code: prefixLimited ? "workbuddy_pending_output_limit" : "workbuddy_empty_reply",
     upstream_status: res.status, upstream_format: format, upstream_bytes: bytes,

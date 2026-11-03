@@ -71,9 +71,6 @@ for (const [name, delta, finish] of [
   ["text", { content: "OK" }, "stop"],
   ["tool fragment", { tool_calls: [{ index: 0, id: "call_fixture" }] }, ""],
   ["tool call", { tool_calls: [{ index: 0, id: "call_fixture", function: { name: "probe", arguments: "{}" } }] }, "tool_calls"],
-  ["legacy function", { function_call: { name: "probe", arguments: "{}" } }, "stop"],
-  ["refusal", { refusal: "Cannot comply" }, "stop"],
-  ["unknown field", { future_output: { data: "fixture" } }, "stop"],
   ["output limit", {}, "length"],
   ["filter", {}, "content_filter"],
 ]) {
@@ -84,6 +81,30 @@ for (const [name, delta, finish] of [
     assert.equal(await res.text(), text)
   })
 }
+
+for (const [name, delta] of [
+  ["structured reasoning", { reasoning_details: [{ type: "summary", text: "Fixture thought" }] }],
+  ["extra metadata", { extra_fields: { internal: "fixture" } }],
+  ["legacy function", { function_call: { name: "probe", arguments: "{}" } }],
+  ["refusal field unsupported by the decoder", { refusal: "Cannot comply" }],
+  ["unknown field", { future_output: { data: "fixture" } }],
+]) {
+  test(`${name} without text or tool_calls cannot silently complete`, async () => {
+    const text = frame({ reasoning_content: "Fixture thought", ...delta }) + frame({}, "stop") + done
+    const res = await guardEmptyReply(response(text), undefined, requireAnswer)
+    assert.equal(res.status, 502)
+    const { error } = await res.json()
+    assert.equal(error.code, "workbuddy_empty_reply")
+    assert.match(error.message, /contained no output \(no answer or tool call\)/)
+  })
+}
+
+test("a top-level stream error is preserved", async () => {
+  const text = `data: ${JSON.stringify({ error: { message: "Fixture failure" }, choices: [] })}\n\n${done}`
+  const res = await guardEmptyReply(response(text), undefined, requireAnswer)
+  assert.equal(res.status, 200)
+  assert.equal(await res.text(), text)
+})
 
 test("a longer reasoning prefix does not silently disable the answer check", async () => {
   const text = frame({ reasoning_content: "x".repeat(70000) }) + frame({}, "stop") + done
