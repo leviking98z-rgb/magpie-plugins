@@ -1618,7 +1618,7 @@ function emptyChat(v, requireAnswer = false) {
   })
 }
 
-function unavailableEmptyReply(res, format, bytes, prefixLimited = false) {
+function unavailableEmptyReply(res, format, bytes, prefixLimited = false, answerRequired = false) {
   const headers = new Headers(res.headers)
   headers.delete("content-length")
   headers.delete("content-encoding")
@@ -1628,7 +1628,9 @@ function unavailableEmptyReply(res, format, bytes, prefixLimited = false) {
   return new Response(JSON.stringify({ error: {
     message: prefixLimited
       ? "WorkBuddy: the pending reply exceeded its buffer limit before an answer or tool call; retry the same model"
-      : "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
+      : answerRequired
+        ? "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no answer or tool call"
+        : "WorkBuddy: an empty reply (the model answered nothing; try again); upstream HTTP 200 contained no output",
     type: "upstream_model_unavailable", code: prefixLimited ? "workbuddy_pending_output_limit" : "workbuddy_empty_reply",
     upstream_status: res.status, upstream_format: format, upstream_bytes: bytes,
   } }), { status: 502, statusText: "Bad Gateway", headers })
@@ -1717,7 +1719,7 @@ async function guardEmptyReply(res, signal, { requireAnswer = false } = {}) {
         scan(dec.decode(), true)
         if (passthrough) return restored()
         release()
-        return unavailableEmptyReply(res, format, bytes)
+        return unavailableEmptyReply(res, format, bytes, false, requireAnswer)
       }
       chunks.push(value)
       bytes += value.byteLength
@@ -1729,7 +1731,7 @@ async function guardEmptyReply(res, signal, { requireAnswer = false } = {}) {
         // No actionable output has escaped, so a failed pending reply is safe
         // to retry. Do not release reasoning alone as a successful empty turn.
         await cancel()
-        return unavailableEmptyReply(res, format, bytes, true)
+        return unavailableEmptyReply(res, format, bytes, true, requireAnswer)
       }
     }
   } catch (e) {

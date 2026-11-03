@@ -33,6 +33,7 @@ for (const field of ["reasoning_content", "reasoning"]) {
     const { error } = await res.json()
     assert.equal(error.code, "workbuddy_empty_reply")
     assert.equal(error.upstream_status, 200)
+    assert.match(error.message, /no answer or tool call/)
   })
 }
 
