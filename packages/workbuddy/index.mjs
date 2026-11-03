@@ -38,6 +38,7 @@ const CN_MODELS = [
   ["kimi-k2.7", "Kimi-K2.7-Code", 256000],
   ["kimi-k2.6", "Kimi-K2.6", 256000],
   ["deepseek-v4-pro", "Deepseek-V4-Pro", 1000000, ["none", "high", "xhigh"]],
+  ["claude-opus-5.5", "Claude-Opus-5.5", 1000000, ["low", "medium", "high", "xhigh", "max"]],
   ["gpt-5.6-sol", "GPT-5.6-Sol", 1000000, ["low", "medium", "high", "xhigh", "max"]],
 ]
 
@@ -1485,8 +1486,8 @@ async function liveModels(site, a) {
         m.images = d.supportsImages === true && !textOnly(site, id)
         Object.assign(m, priceOf(d, cfg.modelPromotions))
         const es = [...(d.reasoning?.supportedEfforts ?? [])]
-        // The GPT-5.6-Sol API accepts max even when the picker omits it.
-        if (id === "gpt-5.6-sol" && !es.includes("max")) es.push("max")
+        // WorkBuddy's picker can lag reasoning levels enabled for its API.
+        if (["claude-opus-5.5", "gpt-5.6-sol"].includes(id) && !es.includes("max")) es.push("max")
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
           m.efforts = [...(!d.onlyReasoning && (canOff == null || canOff) ? ["none"] : []), ...es]
